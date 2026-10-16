@@ -314,12 +314,20 @@ impl Proxy {
         let method = msg.method().unwrap_or_default().to_string();
         let id = msg.id().cloned().unwrap_or(Value::Null);
         let params = msg.v.get("params").cloned();
+        if id.as_str().is_some_and(|s| s.starts_with(&own_prefix())) {
+            // The server's answer would be taken for one meant for the proxy itself.
+            return self.fail_msg(&id, -32600, "mcp-standby: this request id is reserved by the proxy");
+        }
         if method == "initialize" {
-            self.client_init_params = Some(params.clone().filter(|p| !p.is_null()).unwrap_or_else(|| json!({})));
             if let Some(protocol) = self.cached_protocol(params.as_ref()) {
+                // A server already running keeps the parameters it was started with; they describe it.
+                if self.state == State::Idle || self.client_init_params.is_none() {
+                    self.client_init_params = Some(params.clone().filter(|p| !p.is_null()).unwrap_or_else(|| json!({})));
+                }
                 let r = self.init_result(protocol);
                 return self.reply(&id, r);
             }
+            self.client_init_params = Some(params.clone().filter(|p| !p.is_null()).unwrap_or_else(|| json!({})));
             if self.head.is_some() {
                 self.log
                     .info("the client asks for a protocol version the manifest cannot answer; starting the server");
@@ -499,6 +507,7 @@ impl Proxy {
         }
         self.eager_reply = eager_id;
         self.backlog.clear();
+        self.srv_requests.clear();
         let launch = self.launch.clone();
         let log = self.log.clone();
         let tx = self.events.clone();
@@ -603,7 +612,9 @@ impl Proxy {
                 self.server = Some(ok.server.clone());
                 let eager = self.eager_reply.is_some();
                 if let Some(id) = self.eager_reply.take() {
-                    if let Some(h) = ok.head {
+                    // The head built from this handshake stands in only when there was no manifest; an eager
+                    // start for an older protocol version keeps the manifest's (the refresh updates it).
+                    if let (Some(h), None) = (ok.head, &self.head) {
                         self.head = Some(*h);
                     }
                     self.reply(&id, ok.init_result.clone());
@@ -696,6 +707,9 @@ impl Proxy {
                     v["params"]["requestId"] = json!(k);
                     return emit(&v.to_string());
                 }
+                // The client only knows the server's requests by proxy ids, and this one is answered or gone.
+                self.log.debug("server cancellation for a request already answered, dropped");
+                return;
             }
             None => {}
         }
@@ -808,6 +822,13 @@ impl Proxy {
                 let discover = discover.clone().or_else(|| server.probe("server/discover"));
                 manifest::build_manifest(&name, &launch.command, &launch.args, &init, empty, discover)
             });
+            if fresh && !asked_newest {
+                // This session's version says nothing about the server's answer to the newest one: leave it
+                // unknown, so a client asking for the newest version starts the server to find out.
+                if let Some(o) = disk["initialize"].as_object_mut() {
+                    o.remove("protocolVersion");
+                }
+            }
             // Without a manifest the client was answered by the live server, so nothing differs for it.
             let mut changed = fresh;
             let mut notify: Vec<&'static str> = Vec::new();
@@ -830,18 +851,32 @@ impl Proxy {
             let di = disk.get("initialize").cloned().unwrap_or(Value::Null);
             let mut live_init = manifest::init_block(&init);
             if !asked_newest {
-                live_init["protocolVersion"] = di.get("protocolVersion").cloned().unwrap_or(Value::Null);
+                match (di.get("protocolVersion"), live_init.as_object_mut()) {
+                    (Some(v), _) => live_init["protocolVersion"] = v.clone(),
+                    (None, Some(o)) => {
+                        o.remove("protocolVersion");
+                    }
+                    (None, None) => {}
+                }
             }
             let same = di == live_init;
             // `serve -- <command>` with a changed command: record it, so `serve` without one runs it too.
             let now_launch = json!({ "command": launch.command, "args": launch.args });
-            if disk.get("launch") != Some(&now_launch) {
+            let launch_changed = disk.get("launch") != Some(&now_launch);
+            if launch_changed {
                 disk["launch"] = now_launch;
                 changed = true;
                 log.info("manifest launch command updated");
             }
             if !same {
                 disk["initialize"] = live_init.clone();
+                changed = true;
+            }
+            if (!same || launch_changed) && disk.get("negotiated").is_some() {
+                // Answers for older versions belong to the server that gave them; a changed server starts over.
+                if let Some(o) = disk.as_object_mut() {
+                    o.remove("negotiated");
+                }
                 changed = true;
             }
             // Remember what the server agreed on for an older version this session's client asked for.
