@@ -1,0 +1,25 @@
+[package]
+name = "mcp-standby"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Keep MCP servers on standby: answer discovery from a cached manifest and start the real stdio server on first use"
+license = "MIT"
+repository = "https://github.com/vsolano9/mcp-standby"
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "proxy", "stdio", "claude"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
