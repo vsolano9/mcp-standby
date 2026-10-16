@@ -132,8 +132,10 @@ pub struct Proxy {
     // snapshot last. A request that arrives meanwhile runs once after the current one.
     refreshing: bool,
     refresh_again: Option<bool>,
-    // When the last background refresh finished: a list_changed right after it is most likely the server
-    // reacting to the refresh's own list requests.
+    // Whether the running refresh was triggered by the server's list_changed, and when the last such
+    // refresh finished: a list_changed right after it is most likely the server reacting to that refresh's
+    // own list requests.
+    refresh_on_notice: bool,
     refreshed_at: Option<Instant>,
     // Requests and notifications the server sends before the client has its initialize answer and has
     // sent notifications/initialized; delivered in order once both are true.
@@ -178,6 +180,7 @@ impl Proxy {
             eager_reply: None,
             refreshing: false,
             refresh_again: None,
+            refresh_on_notice: false,
             refreshed_at: None,
             backlog: Vec::new(),
             events,
@@ -685,6 +688,7 @@ impl Proxy {
             return;
         }
         self.refreshing = true;
+        self.refresh_on_notice = !tell_client;
         let tx = self.events.clone();
         let log = self.log.clone();
         let path = self.manifest_path.clone();
@@ -775,15 +779,13 @@ impl Proxy {
 
     fn on_refreshed(&mut self, gen: u64, notify: Vec<&'static str>, init: Option<Value>, changed: bool) {
         self.refreshing = false;
-        self.refreshed_at = Some(Instant::now());
+        self.refreshed_at = if self.refresh_on_notice { Some(Instant::now()) } else { None };
         let again = self.refresh_again.take();
-        if gen != self.gen {
-            return;
-        }
-        if let (Some(i), Some(h)) = (init, self.head.as_mut()) {
+        let current = gen == self.gen;
+        if let (true, Some(i), Some(h)) = (current, init, self.head.as_mut()) {
             h.initialize = i;
         }
-        if self.client_initialized {
+        if current && self.client_initialized {
             let mut sent: Vec<&str> = Vec::new();
             for k in notify {
                 let m = changed_method(k);
@@ -793,11 +795,12 @@ impl Proxy {
                 }
             }
         }
-        // Run again for a list_changed that arrived meanwhile, unless this refresh found nothing new: a server
-        // that announces list_changed whenever it is listed would otherwise keep the proxy listing forever.
+        // Run what was asked for meanwhile (for the current server: a restart may have replaced the one this
+        // refresh listed), unless it is only a list_changed and this refresh found nothing new: a server that
+        // announces list_changed whenever it is listed would otherwise keep the proxy listing forever.
         if let (Some(tell), State::Ready, Some(server)) = (again, self.state, self.server.clone()) {
-            if changed || tell {
-                self.refresh_in_background(server, gen, tell);
+            if tell || changed || !current {
+                self.refresh_in_background(server, self.gen, tell);
             }
         }
     }
