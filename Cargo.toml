@@ -2,7 +2,7 @@
 name = "mcp-standby"
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 description = "Keep MCP servers on standby: answer discovery from a cached manifest and start the real stdio server on first use"
 license = "MIT"
 repository = "https://github.com/vsolano9/mcp-standby"

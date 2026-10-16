@@ -153,6 +153,8 @@ impl RealServer {
             })
             .map_err(|e| abort(e.to_string()))?;
         let s2 = server.clone();
+        let line_events = events.clone();
+        let (eof_tx, eof_rx) = channel::<()>();
         std::thread::Builder::new()
             .name("server-stdout".into())
             .spawn(move || {
@@ -172,21 +174,35 @@ impl RealServer {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    s2.on_line(&line, &events);
+                    s2.on_line(&line, &line_events);
                 }
+                let _ = eof_tx.send(());
+            })
+            .map_err(|e| abort(e.to_string()))?;
+        // The exit is taken from the process itself: a child that inherited the server's stdout can keep
+        // the pipe open long after the server is gone.
+        let s3 = server.clone();
+        std::thread::Builder::new()
+            .name("server-wait".into())
+            .spawn(move || {
                 let why = match child.wait() {
                     Ok(st) => exit_text(&st),
                     Err(e) => format!("exited (wait failed: {e})"),
                 };
-                s2.exited.store(true, Ordering::SeqCst);
-                s2.died(&why);
-                events(ServerEvent::Exit { gen: s2.gen, why });
+                // Let the reader pass on what the server wrote before it exited.
+                let _ = eof_rx.recv_timeout(Duration::from_millis(500));
+                s3.exited.store(true, Ordering::SeqCst);
+                s3.died(&why);
+                events(ServerEvent::Exit { gen: s3.gen, why });
             })
             .map_err(|e| abort(e.to_string()))?;
         Ok(server)
     }
 
     fn on_line(&self, line: &str, events: &Sink) {
+        if self.dead.load(Ordering::SeqCst) {
+            return; // the server is gone; anything left on the pipe comes from a process it left behind
+        }
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
             match serde_json::from_str::<Vec<&RawValue>>(trimmed) {

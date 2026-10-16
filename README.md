@@ -31,7 +31,7 @@ Download the archive for your platform from the [latest release](https://github.
 | Linux x64 (static, any distribution) | `mcp-standby-v1.0.0-x86_64-unknown-linux-musl.tar.gz` |
 | macOS 11+ Apple silicon | `mcp-standby-v1.0.0-aarch64-apple-darwin.tar.gz` |
 
-Or build it (Rust 1.80+):
+Or build it (Rust 1.85+):
 
 ```sh
 cargo install --git https://github.com/vsolano9/mcp-standby --locked
@@ -105,7 +105,7 @@ The data directory is `MCP_STANDBY_HOME` if set, else `%LOCALAPPDATA%\mcp-standb
 
 - **Answered from the manifest, no server:** `initialize` (cached `serverInfo`, `instructions` and `capabilities`, with `listChanged` added; protocol versions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05, answering the client's version unless the server recorded an older one), `ping`, `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, and the `server/discover` probe some clients send before `initialize`.
 - **Starts the server:** anything else, such as `tools/call`, `resources/read`, `prompts/get` or `completion/complete`. Requests and notifications that arrive while it starts are queued (a queued request the client cancels is dropped). The proxy sends the server the client's original `initialize` parameters, then forwards everything in order. JSON-RPC ids pass through untouched; server-initiated requests (sampling, roots, elicitation), notifications, progress and cancellations flow both ways, and the server's own messages reach the client only after it has its `initialize` answer.
-- **Once the server runs,** list requests go to it, so the client always sees its current lists. After a deferred start the proxy compares the live lists, `initialize` result and launch command with the manifest in the background; when they differ it rewrites the manifest (atomically) and sends the client `list_changed` for the lists that changed. When the server itself sends `list_changed`, the client gets it and, a second later, the manifest is updated for the next session (one refresh at a time).
+- **Once the server runs,** list requests go to it, so the client always sees its current lists. After a deferred start the proxy compares the live lists, `initialize` result and launch command with the manifest in the background; when they differ it rewrites the manifest (atomically) and sends the client `list_changed` for the lists that changed. When the server itself sends `list_changed`, the client gets it and, after a short wait, the manifest is updated for the next session (one refresh at a time; the wait grows from 1 s to 60 s while refreshes find nothing new, so a server that announces changes it does not make costs little).
 - **Shutdown:** when the client closes stdin (and on SIGTERM, SIGINT or SIGHUP on Unix) the proxy stops the server and the processes it started: `taskkill /T /F` on the server's process tree on Windows, SIGTERM then (after 2 s) SIGKILL to the server's process group on Unix.
 
 | Situation | Behavior |

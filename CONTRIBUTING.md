@@ -4,7 +4,7 @@ Issues and pull requests are welcome. Keep changes focused on what the proxy pro
 
 ## Set up
 
-Rust 1.80 or later. There is one binary and no runtime dependencies.
+Rust 1.85 or later. There is one binary and no runtime dependencies.
 
 ```sh
 git clone https://github.com/vsolano9/mcp-standby.git
