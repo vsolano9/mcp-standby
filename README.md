@@ -31,6 +31,8 @@ Download the archive for your platform from the [latest release](https://github.
 | Linux x64 (static, any distribution) | `mcp-standby-v1.0.0-x86_64-unknown-linux-musl.tar.gz` |
 | macOS 11+ Apple silicon | `mcp-standby-v1.0.0-aarch64-apple-darwin.tar.gz` |
 
+On macOS the binary is not signed. An archive downloaded with a browser and opened in Finder is quarantined, and the binary is then stopped without a message when it runs. Download with `curl -LO` and unpack with `tar -xzf`, or clear the flag once with `xattr -d com.apple.quarantine mcp-standby`.
+
 Or build it (Rust 1.85+):
 
 ```sh
