@@ -122,7 +122,7 @@ Commands are found through the absolute entries of `PATH` (and `PATHEXT` on Wind
 
 - It saves memory and process count, not context tokens: the client still sees every tool. If your problem is tool definitions filling the context window, look at your client's tool search or a gateway that exposes tools on demand.
 - The manifest is a snapshot taken when the server last ran. It is corrected the first time the server runs in a later session, not before.
-- Protocol versions are cached per server: the manifest tells a changed server by its `initialize` answer (name, version, capabilities, instructions) and its command. A server replaced in place under the same name, version and command keeps its recorded versions until a client asking for the newest version uses it; a client told a version the server no longer speaks gets the server's own answer once it starts.
+- Protocol versions are cached per server: the manifest tells a changed server by its `initialize` answer (name, version, capabilities, instructions) and its command. A server replaced in place under the same name, version and command keeps its recorded versions until a client asking for the newest version uses it. A client told a recorded version that the new server answers differently keeps that version for its session; the manifest is corrected for the next one.
 - There is no idle shutdown: once started, the server runs until the session ends (many servers keep session state).
 - stdio servers only; no HTTP or SSE transport.
 - If the proxy itself is killed hard (`kill -9`, `taskkill /F` on it), it cannot stop the server. The server sees its stdin close, and most servers exit then.
