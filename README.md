@@ -11,15 +11,15 @@ client ──stdio──> mcp-standby ──(first tools/call)──> real serve
                        ping: answered from the manifest, no server running
 ```
 
-Measured on Windows 11 with the reference [`@modelcontextprotocol/server-everything`](https://github.com/modelcontextprotocol/servers) 1.0.0 (Node 24): private memory of the whole process tree after `initialize` and `tools/list` and 3 s idle, and for the last row after one `tools/call` and 3 s idle:
+Measured on Windows 11 with the reference [`@modelcontextprotocol/server-everything`](https://github.com/modelcontextprotocol/servers) 1.0.0 (Node 24), four runs: private memory of the whole process tree after `initialize` and `tools/list` and 3 s idle, and for the last row after one `tools/call` and 3 s idle:
 
 | | Memory | Processes |
 |---|---|---|
-| Server started directly | 47.8 to 48.3 MB | `node` |
-| Behind `mcp-standby`, before first use | 0.8 MB | `mcp-standby` |
-| Behind `mcp-standby`, after first use | 49.5 to 49.9 MB | `mcp-standby` 1.1 to 1.3 MB + `node` |
+| Server started directly | 48 to 50 MB | `node` |
+| Behind `mcp-standby`, before first use | 0.7 to 0.8 MB | `mcp-standby` |
+| Behind `mcp-standby`, after first use | 49 to 50 MB | `mcp-standby` 1.0 to 1.3 MB + `node` |
 
-Over three runs the first `tools/call` took 210 to 330 ms (it starts the server and does the MCP handshake); the next one took 1 ms. Heavier servers (Python ML stacks, browser automation, Ghidra-style tools) save correspondingly more. Your numbers depend on the server.
+The first `tools/call` took 210 to 330 ms (it starts the server and does the MCP handshake); the next one took 1 ms. Heavier servers (Python ML stacks, browser automation, Ghidra-style tools) save correspondingly more. Your numbers depend on the server.
 
 ## Install
 
