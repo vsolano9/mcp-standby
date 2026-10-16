@@ -30,6 +30,7 @@ static SHARED: OnceLock<Arc<Mutex<Shared>>> = OnceLock::new();
 static LOG: OnceLock<Arc<Logger>> = OnceLock::new();
 // Set while `refresh` runs: an interrupted refresh exits non-zero.
 static REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PANICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn help() -> String {
     format!(
@@ -39,8 +40,8 @@ Keeps an MCP server on standby: discovery is answered from a cached manifest, an
 server starts on the first request that needs it.
 
 Usage:
-  mcp-standby serve   --manifest <file> [options] -- <command> [args...]
-  mcp-standby refresh --manifest <file> [options] -- <command> [args...]
+  mcp-standby serve   (--name <name> | --manifest <file>) [options] [-- <command> [args...]]
+  mcp-standby refresh (--name <name> | --manifest <file>) [options] -- <command> [args...]
 
   refresh  start the server once, record initialize and every list into the manifest, stop it
   serve    what an MCP client launches (stdio)
@@ -171,11 +172,8 @@ pub fn stop(why: &str) -> ! {
             }
         }
     }
-    std::process::exit(if REFRESHING.load(std::sync::atomic::Ordering::SeqCst) {
-        1
-    } else {
-        0
-    });
+    let failed = REFRESHING.load(std::sync::atomic::Ordering::SeqCst) || PANICKED.load(std::sync::atomic::Ordering::SeqCst);
+    std::process::exit(if failed { 1 } else { 0 });
 }
 
 struct Opts {
@@ -333,19 +331,28 @@ fn main() {
 fn refresh(name: &str, manifest_path: &Path, launch: &Launch, log: Arc<Logger>, timeout: Duration) -> i32 {
     let sink: Sink = Arc::new(|_| {});
     REFRESHING.store(true, std::sync::atomic::Ordering::SeqCst);
-    let server = match RealServer::spawn(launch, log, 1, sink) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("mcp-standby: refresh failed: {e}");
-            return 1;
+    // Ctrl+C during a refresh must not leave the server (in its own process group on Unix) running: the
+    // signal watcher is up before the spawn, and the lock it waits for is held until the server is recorded.
+    let shared = Arc::new(Mutex::new(Shared {
+        shutting_down: false,
+        server: None,
+    }));
+    let _ = SHARED.set(shared.clone());
+    watch_signals();
+    let server = {
+        let mut g = shared.lock().unwrap_or_else(|p| p.into_inner());
+        match RealServer::spawn(launch, log, 1, sink) {
+            Ok(s) => {
+                g.server = Some(s.clone());
+                s
+            }
+            Err(e) => {
+                drop(g);
+                eprintln!("mcp-standby: refresh failed: {e}");
+                return 1;
+            }
         }
     };
-    // Ctrl+C during a refresh must not leave the server (in its own process group on Unix) running.
-    let _ = SHARED.set(Arc::new(Mutex::new(Shared {
-        shutting_down: false,
-        server: Some(server.clone()),
-    })));
-    watch_signals();
     let run = || -> Result<String, String> {
         let init = server
             .handshake(
@@ -401,6 +408,7 @@ fn serve(name: String, manifest_path: PathBuf, launch: Launch, log: Arc<Logger>,
         if let Some(l) = LOG.get() {
             l.error(&format!("uncaught: {info}"));
         }
+        PANICKED.store(true, std::sync::atomic::Ordering::SeqCst);
         stop("uncaught exception");
     }));
     let (tx, rx) = channel::<Event>();

@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
 use serde_json::{json, Map, Value};
@@ -54,6 +54,7 @@ pub enum Event {
         gen: u64,
         notify: Vec<&'static str>,
         init: Option<Value>,
+        changed: bool,
     },
 }
 
@@ -126,6 +127,17 @@ pub struct Proxy {
     inflight: HashMap<String, Value>,
     served: HashMap<&'static str, u64>,
     eager_reply: Option<Value>,
+    // One background list refresh at a time: a server that sends a burst of list_changed (one per tool
+    // it registers) must not start overlapping refreshes, where a slow older one could write its stale
+    // snapshot last. A request that arrives meanwhile runs once after the current one.
+    refreshing: bool,
+    refresh_again: Option<bool>,
+    // When the last background refresh finished: a list_changed right after it is most likely the server
+    // reacting to the refresh's own list requests.
+    refreshed_at: Option<Instant>,
+    // Requests and notifications the server sends before the client has its initialize answer and has
+    // sent notifications/initialized; delivered in order once both are true.
+    backlog: Vec<String>,
     events: Sender<Event>,
     shared: Arc<Mutex<Shared>>,
 }
@@ -164,6 +176,10 @@ impl Proxy {
             inflight: HashMap::new(),
             served: HashMap::new(),
             eager_reply: None,
+            refreshing: false,
+            refresh_again: None,
+            refreshed_at: None,
+            backlog: Vec::new(),
             events,
             shared,
         }
@@ -176,7 +192,12 @@ impl Proxy {
             Event::Server(ServerEvent::Line { gen, text, response_key }) => self.on_server_line(gen, &text, response_key),
             Event::Server(ServerEvent::Exit { gen, why }) => self.on_server_exit(gen, &why),
             Event::Started { gen, result } => self.on_started(gen, result),
-            Event::Refreshed { gen, notify, init } => self.on_refreshed(gen, notify, init),
+            Event::Refreshed {
+                gen,
+                notify,
+                init,
+                changed,
+            } => self.on_refreshed(gen, notify, init, changed),
         }
     }
 
@@ -334,6 +355,7 @@ impl Proxy {
         let method = msg.method().unwrap_or_default().to_string();
         if method == "notifications/initialized" {
             self.client_initialized = true;
+            self.flush_backlog();
             return;
         }
         if method == "notifications/cancelled" {
@@ -345,12 +367,17 @@ impl Proxy {
                 }
             }
         }
-        match (&self.state, &self.server) {
-            (State::Ready, Some(s)) => {
+        if self.state == State::Ready {
+            if let Some(s) = &self.server {
                 s.send_text(&msg.raw);
+                return;
             }
-            _ => self.log.debug(&format!("dropping {method}; no server running")),
         }
+        if self.state == State::Starting {
+            self.queue.push(msg); // delivered in order after the server's handshake
+            return;
+        }
+        self.log.debug(&format!("dropping {method}; no server running"));
     }
 
     fn forward(&mut self, msg: Msg) {
@@ -380,10 +407,19 @@ impl Proxy {
     fn init_result(&self, client_params: Option<&Value>) -> Value {
         let h = self.head.as_ref().expect("manifest head");
         let wanted = client_params.and_then(|p| p.get("protocolVersion")).and_then(|v| v.as_str());
-        let protocol = match wanted {
-            Some(w) if SUPPORTED_VERSIONS.contains(&w) => w.to_string(),
-            _ => SUPPORTED_VERSIONS[0].to_string(),
-        };
+        // The real server gets the client's own initialize parameters later, so answer what it negotiated
+        // before: the client's version when the server already answered one at least as new, else the
+        // recorded one (a server answers with its newest version when it lacks the one asked for).
+        let known = |v: &&str| SUPPORTED_VERSIONS.contains(v);
+        let wanted = wanted.filter(known);
+        let recorded = h.initialize.get("protocolVersion").and_then(|v| v.as_str()).filter(known);
+        let protocol = match (wanted, recorded) {
+            (Some(w), Some(r)) if w > r => r,
+            (Some(w), _) => w,
+            (None, Some(r)) => r,
+            (None, None) => SUPPORTED_VERSIONS[0],
+        }
+        .to_string();
         let mut caps = manifest::capabilities_or_empty(&h.initialize);
         // The proxy can announce list changes after a refresh, so advertise it.
         for c in ["tools", "prompts", "resources"] {
@@ -413,7 +449,13 @@ impl Proxy {
         self.gen += 1;
         let gen = self.gen;
         let eager = eager_id.is_some();
+        if eager {
+            if let Some(old) = self.eager_reply.take() {
+                self.fail_msg(&old, -32600, "mcp-standby: initialize sent again before the first one was answered");
+            }
+        }
         self.eager_reply = eager_id;
+        self.backlog.clear();
         let launch = self.launch.clone();
         let log = self.log.clone();
         let tx = self.events.clone();
@@ -537,23 +579,29 @@ impl Proxy {
                 ));
                 let queued: Vec<Msg> = std::mem::take(&mut self.queue);
                 for m in queued {
-                    self.forward(m);
+                    if m.id().is_some() {
+                        self.forward(m);
+                    } else if let Some(s) = &self.server {
+                        s.send_text(&m.raw);
+                    }
                 }
+                self.flush_backlog();
                 if !eager {
                     self.refresh_in_background(ok.server, gen, true);
                 }
             }
             Err((server, e)) => {
+                if let Some(s) = server {
+                    s.kill();
+                    self.forget_shared(&s);
+                }
+                if gen != self.gen {
+                    return; // a replaced start; the current one answers for itself
+                }
                 self.log.error(&format!("failed to start real server: {e}"));
                 self.fail_queue(&e);
-                if gen == self.gen {
-                    if let Some(s) = server {
-                        s.kill();
-                        self.forget_shared(&s);
-                    }
-                    self.server = None;
-                    self.state = State::Idle;
-                }
+                self.server = None;
+                self.state = State::Idle;
             }
         }
     }
@@ -562,14 +610,34 @@ impl Proxy {
         if gen != self.gen {
             return;
         }
-        let is_response = response_key.is_some();
         if let Some(k) = response_key {
             self.inflight.remove(&k);
+            emit(text);
+            return;
         }
+        if self.state != State::Ready || !self.client_initialized {
+            self.backlog.push(text.to_string());
+            return;
+        }
+        self.deliver(gen, text);
+    }
+
+    fn flush_backlog(&mut self) {
+        if self.state != State::Ready || !self.client_initialized {
+            return;
+        }
+        let gen = self.gen;
+        for text in std::mem::take(&mut self.backlog) {
+            self.deliver(gen, &text);
+        }
+    }
+
+    /// A request or notification from the server, once the client may receive it.
+    fn deliver(&mut self, gen: u64, text: &str) {
         emit(text);
         // The server changed a list: the client hears it from the server itself (just forwarded); bring
         // the manifest up to date so the next session's discovery is not stale either.
-        if !is_response && text.contains("list_changed") && self.state == State::Ready {
+        if text.contains("list_changed") {
             let method = serde_json::from_str::<Value>(text)
                 .ok()
                 .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|m| m.to_string()));
@@ -577,7 +645,8 @@ impl Proxy {
                 .map(|m| m.starts_with("notifications/") && m.ends_with("/list_changed"))
                 .unwrap_or(false)
             {
-                if let Some(server) = self.server.clone() {
+                let echo = !self.refreshing && self.refreshed_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1));
+                if let (false, Some(server)) = (echo, self.server.clone()) {
                     self.refresh_in_background(server, gen, false);
                 }
             }
@@ -599,6 +668,7 @@ impl Proxy {
             self.forget_shared(&s);
         }
         self.state = State::Idle;
+        self.backlog.clear();
         if lock(&self.shared).shutting_down {
             return;
         }
@@ -609,7 +679,12 @@ impl Proxy {
     // After a deferred start (or a list_changed from the server), compare the live lists with the manifest
     // and rewrite it when they differ. `tell_client`: also send list_changed for what differs from what
     // the client was served from the manifest.
-    fn refresh_in_background(&self, server: Arc<RealServer>, gen: u64, tell_client: bool) {
+    fn refresh_in_background(&mut self, server: Arc<RealServer>, gen: u64, tell_client: bool) {
+        if self.refreshing {
+            self.refresh_again = Some(self.refresh_again.unwrap_or(false) || tell_client);
+            return;
+        }
+        self.refreshing = true;
         let tx = self.events.clone();
         let log = self.log.clone();
         let path = self.manifest_path.clone();
@@ -618,15 +693,27 @@ impl Proxy {
         let launch = self.launch.clone();
         let discover = self.head.as_ref().and_then(|h| h.discover.clone());
         let _ = std::thread::Builder::new().name("refresh".into()).spawn(move || {
+            let done = |notify: Vec<&'static str>, init: Option<Value>, changed: bool| {
+                let _ = tx.send(Event::Refreshed {
+                    gen,
+                    notify,
+                    init,
+                    changed,
+                });
+            };
+            if !tell_client {
+                // Triggered by the server's list_changed: let a burst (one per tool it registers) settle.
+                std::thread::sleep(Duration::from_secs(1));
+            }
             let lists = match server.fetch_lists(Duration::from_secs(60)) {
                 Ok(l) => l,
                 Err(e) => {
                     log.warn(&format!("background list refresh failed: {e}"));
-                    return;
+                    return done(Vec::new(), None, false);
                 }
             };
             if server.is_dead() {
-                return;
+                return done(Vec::new(), None, false);
             }
             let init = lock(&server.init_result).clone().unwrap_or(Value::Null);
             let mut disk = manifest::read_full(&path).unwrap_or_else(|| {
@@ -656,7 +743,15 @@ impl Proxy {
             }
             let di = disk.get("initialize").cloned().unwrap_or(Value::Null);
             let same = di.get("serverInfo") == init.get("serverInfo")
+                && di.get("protocolVersion") == init.get("protocolVersion")
                 && di.get("capabilities").cloned().unwrap_or(Value::Null) == manifest::capabilities_or_empty(&init);
+            // `serve -- <command>` with a changed command: record it, so `serve` without one runs it too.
+            let now_launch = json!({ "command": launch.command, "args": launch.args });
+            if disk.get("launch") != Some(&now_launch) {
+                disk["launch"] = now_launch;
+                changed = true;
+                log.info("manifest launch command updated");
+            }
             if !same {
                 disk["initialize"] = manifest::init_block(&init);
                 changed = true;
@@ -674,15 +769,14 @@ impl Proxy {
                 log.info(&format!("manifest refreshed (changed: {what})"));
             }
             let notify = if tell_client { notify } else { Vec::new() };
-            let _ = tx.send(Event::Refreshed {
-                gen,
-                notify,
-                init: if same { None } else { Some(manifest::init_block(&init)) },
-            });
+            done(notify, if same { None } else { Some(manifest::init_block(&init)) }, changed);
         });
     }
 
-    fn on_refreshed(&mut self, gen: u64, notify: Vec<&'static str>, init: Option<Value>) {
+    fn on_refreshed(&mut self, gen: u64, notify: Vec<&'static str>, init: Option<Value>, changed: bool) {
+        self.refreshing = false;
+        self.refreshed_at = Some(Instant::now());
+        let again = self.refresh_again.take();
         if gen != self.gen {
             return;
         }
@@ -697,6 +791,13 @@ impl Proxy {
                     sent.push(m);
                     emit(&json!({ "jsonrpc": "2.0", "method": m }).to_string());
                 }
+            }
+        }
+        // Run again for a list_changed that arrived meanwhile, unless this refresh found nothing new: a server
+        // that announces list_changed whenever it is listed would otherwise keep the proxy listing forever.
+        if let (Some(tell), State::Ready, Some(server)) = (again, self.state, self.server.clone()) {
+            if changed || tell {
+                self.refresh_in_background(server, gen, tell);
             }
         }
     }

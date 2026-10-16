@@ -1,6 +1,6 @@
 # Contributing
 
-Issues and pull requests are welcome. Keep changes focused on what the proxy promises: a client sees the same server it would see without the proxy, and the server does not run until a request needs it.
+Issues and pull requests are welcome. Keep changes focused on what the proxy promises: a client sees the server's own tools, prompts, resources and answers, and the server does not run until a request needs it.
 
 ## Set up
 
@@ -20,11 +20,11 @@ cargo clippy --release -- -D warnings
 cargo build --release
 ```
 
-Then exercise the real path against a real MCP server, on each OS your change touches. The README's "Try it" section is the minimum: `refresh`, then `serve` with a client (or a scripted one) and check that
+Then exercise the real path against a real MCP server, on each OS your change touches. At minimum, run `refresh`, then `serve` with a client (or a scripted one) and check that
 
 - `initialize` and `tools/list` are answered while no server process exists,
 - the first `tools/call` starts the server and gets its answer,
-- closing the client's stdin removes the server and every process it started,
+- closing the client's stdin removes the server and the processes it started that are still attached to it,
 - after the server changes a list and sends `list_changed`, the client gets the notification, `tools/list` returns the new list, and the manifest is rewritten.
 
 For lifecycle changes also check a server that exits on its own, a command that cannot be resolved, a server that never answers `initialize` (`--startup-timeout`), and on Unix SIGTERM to the proxy. Check process cleanup on the OS itself; Windows (`taskkill /T`) and Unix (process groups) work differently.

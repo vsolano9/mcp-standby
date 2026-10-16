@@ -108,9 +108,13 @@ impl RealServer {
             launch.command,
             launch.args.len()
         ));
-        let stdin = child.stdin.take().ok_or("no stdin pipe")?;
-        let stdout = child.stdout.take().ok_or("no stdout pipe")?;
-        let stderr = child.stderr.take().ok_or("no stderr pipe")?;
+        let abort = |e: String| -> String {
+            kill_tree(pid);
+            e
+        };
+        let stdin = child.stdin.take().ok_or_else(|| abort("no stdin pipe".into()))?;
+        let stdout = child.stdout.take().ok_or_else(|| abort("no stdout pipe".into()))?;
+        let stderr = child.stderr.take().ok_or_else(|| abort("no stderr pipe".into()))?;
         let (wtx, wrx) = channel::<Vec<u8>>();
         let server = Arc::new(RealServer {
             pid,
@@ -133,7 +137,7 @@ impl RealServer {
                     }
                 }
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| abort(e.to_string()))?;
         let log2 = log.clone();
         std::thread::Builder::new()
             .name("server-stderr".into())
@@ -147,7 +151,7 @@ impl RealServer {
                     }
                 }
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| abort(e.to_string()))?;
         let s2 = server.clone();
         std::thread::Builder::new()
             .name("server-stdout".into())
@@ -178,7 +182,7 @@ impl RealServer {
                 s2.died(&why);
                 events(ServerEvent::Exit { gen: s2.gen, why });
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| abort(e.to_string()))?;
         Ok(server)
     }
 
@@ -210,19 +214,21 @@ impl RealServer {
         if peek.method.is_none() {
             if let Some(id) = peek.id {
                 if let Ok(s) = serde_json::from_str::<String>(id.get()) {
-                    if s.starts_with(PREFIX) {
-                        let waiter = lock(&self.pending).remove(&s);
-                        if let Some((method, tx)) = waiter {
-                            let r = match (peek.error, peek.result) {
-                                (Some(e), _) if e.get().trim() != "null" => Err(CallError::Rpc {
-                                    method,
-                                    error: serde_json::from_str(e.get()).unwrap_or(Value::Null),
-                                }),
-                                (_, Some(r)) => Ok(serde_json::from_str(r.get()).unwrap_or(Value::Null)),
-                                _ => Ok(Value::Null),
-                            };
-                            let _ = tx.send(r);
-                        }
+                    let waiter = if s.starts_with(PREFIX) {
+                        lock(&self.pending).remove(&s)
+                    } else {
+                        None
+                    };
+                    if let Some((method, tx)) = waiter {
+                        let r = match (peek.error, peek.result) {
+                            (Some(e), _) if e.get().trim() != "null" => Err(CallError::Rpc {
+                                method,
+                                error: serde_json::from_str(e.get()).unwrap_or(Value::Null),
+                            }),
+                            (_, Some(r)) => Ok(serde_json::from_str(r.get()).unwrap_or(Value::Null)),
+                            _ => Ok(Value::Null),
+                        };
+                        let _ = tx.send(r);
                         return;
                     }
                 }

@@ -4,15 +4,17 @@
 
 `mcp-standby` is a local stdio proxy between an MCP client and one MCP server that the client's own configuration names. It has no network listener, telemetry, update checker or network requests of its own. The server it starts runs with the user's permissions, exactly as it would without the proxy.
 
-It is not a sandbox, permission layer or policy gate. Requests, responses and server-initiated messages (sampling, roots, elicitation) are forwarded unchanged. Use your client's own approval settings for tool calls.
+It is not a sandbox, permission layer or policy gate. While the server is not running, the proxy answers `initialize`, `ping`, the list methods and `server/discover` itself from the manifest (adding `listChanged` to the capabilities). Every other request, every response and every server-initiated message (sampling, roots, elicitation) is forwarded unchanged. Use your client's own approval settings for tool calls.
 
 ## Local data
 
 - **Manifests** (`<data dir>/manifests/<name>.json`) record the server's `initialize` result, its tool, prompt and resource lists, and its launch command and arguments. They never record environment variables. A secret passed as a command-line argument would therefore be written to the manifest: pass secrets through environment variables (the client's `env` block or `--env`) instead.
-- **Logs** (`<data dir>/logs/<name>.log`, 1 MB with 3 rotations, or none with `--no-log-file`) record lifecycle events, the server's stderr, and the command name with its argument count, not the arguments. A server that prints secrets to stderr puts them in the log; the proxy cannot tell.
+- **Logs** (`<data dir>/logs/<name>.log`, 1 MB with 3 rotations, or none with `--no-log-file`) record lifecycle events, the server's stderr, up to 200 characters of any server stdout line that is not JSON, and the command name with its argument count, not the arguments. A server that prints secrets to stderr or stdout puts them in the log; the proxy cannot tell.
 - The data directory is `MCP_STANDBY_HOME`, else `%LOCALAPPDATA%\mcp-standby` on Windows, else `$XDG_DATA_HOME/mcp-standby` or `~/.local/share/mcp-standby`. Keep it private to your user. A manifest someone else can write could change the tools your client sees until the server starts and the proxy refreshes the lists.
 
-Commands are resolved through `PATH` (and `PATHEXT` on Windows) without searching the current directory, so a file planted in a repository the client opens cannot stand in for the server. An untrusted directory on `PATH` is still part of your trust boundary.
+A bare command name (`npx`, `uvx`) is resolved through the absolute entries of `PATH` (and `PATHEXT` on Windows); relative entries such as `.` are skipped and the current directory is never searched, so a file planted in a repository the client opens cannot stand in for a bare command. A command written as a relative path (`./bin/server`) is resolved from `--cwd`, or the directory the proxy starts in, so only use one when that directory is trusted. An untrusted directory on `PATH` is still part of your trust boundary.
+
+On Windows, `.cmd` and `.bat` launchers run through `cmd.exe` with every argument quoted and escaped for both of its parsing passes, so arguments containing `&`, `|`, `%` or quotes reach the server as written instead of being run as commands.
 
 ## Report a vulnerability
 

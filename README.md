@@ -11,7 +11,7 @@ client ──stdio──> mcp-standby ──(first tools/call)──> real serve
                        ping: answered from the manifest, no server running
 ```
 
-Measured on Windows 11 with the reference [`@modelcontextprotocol/server-everything`](https://github.com/modelcontextprotocol/servers) 1.0.0 (Node 24), after `initialize` and `tools/list`, idle for 3 s, private memory of the whole process tree:
+Measured on Windows 11 with the reference [`@modelcontextprotocol/server-everything`](https://github.com/modelcontextprotocol/servers) 1.0.0 (Node 24): private memory of the whole process tree after `initialize` and `tools/list` and 3 s idle, and for the last row after one `tools/call` and 3 s idle:
 
 | | Memory | Processes |
 |---|---|---|
@@ -103,10 +103,10 @@ The data directory is `MCP_STANDBY_HOME` if set, else `%LOCALAPPDATA%\mcp-standb
 
 ## How it works
 
-- **Answered from the manifest, no server:** `initialize` (cached `serverInfo`, `instructions` and `capabilities`; the protocol version the client asks for when supported: 2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05), `ping`, `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, and the `server/discover` probe some clients send before `initialize`.
-- **Starts the server:** anything else, such as `tools/call`, `resources/read`, `prompts/get` or `completion/complete`. Messages that arrive while it starts are queued. The proxy sends the server the client's original `initialize` parameters, then forwards everything in order. JSON-RPC ids pass through untouched; server-initiated requests (sampling, roots, elicitation), notifications, progress and cancellations flow both ways.
-- **Once the server runs,** list requests go to it, so the client always sees its current lists. After a deferred start the proxy compares the live lists with the manifest in the background; when they differ it rewrites the manifest (atomically) and sends the client `list_changed`. When the server itself sends `list_changed`, the client gets it and the manifest is updated for the next session.
-- **Shutdown:** when the client closes stdin (and on SIGTERM, SIGINT or SIGHUP on Unix) the proxy stops the server and everything it started: `taskkill /T /F` on Windows, SIGTERM then SIGKILL to the server's process group on Unix.
+- **Answered from the manifest, no server:** `initialize` (cached `serverInfo`, `instructions` and `capabilities`, with `listChanged` added; protocol versions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05, answering the client's version unless the server recorded an older one), `ping`, `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, and the `server/discover` probe some clients send before `initialize`.
+- **Starts the server:** anything else, such as `tools/call`, `resources/read`, `prompts/get` or `completion/complete`. Requests and notifications that arrive while it starts are queued (a queued request the client cancels is dropped). The proxy sends the server the client's original `initialize` parameters, then forwards everything in order. JSON-RPC ids pass through untouched; server-initiated requests (sampling, roots, elicitation), notifications, progress and cancellations flow both ways, and the server's own messages reach the client only after it has its `initialize` answer.
+- **Once the server runs,** list requests go to it, so the client always sees its current lists. After a deferred start the proxy compares the live lists, `initialize` result and launch command with the manifest in the background; when they differ it rewrites the manifest (atomically) and sends the client `list_changed` for the lists that changed. When the server itself sends `list_changed`, the client gets it and, a second later, the manifest is updated for the next session (one refresh at a time).
+- **Shutdown:** when the client closes stdin (and on SIGTERM, SIGINT or SIGHUP on Unix) the proxy stops the server and the processes it started: `taskkill /T /F` on the server's process tree on Windows, SIGTERM then (after 2 s) SIGKILL to the server's process group on Unix.
 
 | Situation | Behavior |
 |---|---|
@@ -116,7 +116,7 @@ The data directory is `MCP_STANDBY_HOME` if set, else `%LOCALAPPDATA%\mcp-standb
 | Command not found | Same as a failed start, with the reason in the error message |
 | Client sends a JSON-RPC batch | Handled element by element |
 
-Commands are found through `PATH` (and `PATHEXT` on Windows, where `.cmd` and `.bat` launchers such as `npx.cmd` run through `cmd.exe` with each argument quoted). The current directory is never searched for a bare command name. On Windows the proxy is a GUI-subsystem program, so it does not get a console window of its own; the server gets a hidden one.
+Commands are found through the absolute entries of `PATH` (and `PATHEXT` on Windows, where `.cmd` and `.bat` launchers such as `npx.cmd` run through `cmd.exe` with each argument quoted and escaped). The current directory is never searched for a bare command name; a command given as a relative path is resolved from `--cwd`. On Windows the proxy is a GUI-subsystem program, so it does not get a console window of its own; the server gets a hidden one.
 
 ## Limits
 
@@ -125,7 +125,8 @@ Commands are found through `PATH` (and `PATHEXT` on Windows, where `.cmd` and `.
 - There is no idle shutdown: once started, the server runs until the session ends (many servers keep session state).
 - stdio servers only; no HTTP or SSE transport.
 - If the proxy itself is killed hard (`kill -9`, `taskkill /F` on it), it cannot stop the server. The server sees its stdin close, and most servers exit then.
-- A server that exits on its own can leave processes it started behind; the proxy only signals a server that is still running, so it never hits a reused process ID.
+- A server that exits on its own can leave processes it started behind; the proxy only signals a server that is still running, so it never hits a reused process ID. Processes that detach (a new session or process group on Unix, or a child whose parent already exited on Windows) are outside the tree the proxy stops.
+- Servers whose lists depend on the client (for example tools offered only to clients with elicitation) are recorded as the last client saw them.
 - Manifests record the launch command and its arguments, never the environment. Pass secrets through environment variables, not arguments. See [SECURITY.md](SECURITY.md).
 
 ## Related projects

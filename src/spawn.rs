@@ -36,7 +36,8 @@ fn base_dir(launch: &Launch) -> PathBuf {
 
 fn first_hit(path: &OsString, candidates: impl Fn(PathBuf) -> Vec<PathBuf>, ok: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     for d in std::env::split_paths(path) {
-        if d.as_os_str().is_empty() {
+        // An empty or relative entry ("." included) would search the working directory.
+        if !d.is_absolute() {
             continue;
         }
         if let Some(hit) = candidates(d).into_iter().find(|p| ok(p)) {
@@ -87,8 +88,10 @@ mod os {
         first_hit(&env_lookup(&launch.env, "PATH")?, candidates, is_file)
     }
 
-    /// cross-spawn style escaping of one argument for `cmd.exe /d /s /c "..."`.
-    fn escape_for_cmd(arg: &str) -> String {
+    /// cross-spawn style escaping of one argument for `cmd.exe /d /s /c "..."`. `parses`: how many times
+    /// cmd.exe reads it: once for the batch file's own path, twice for its arguments (the batch file
+    /// re-reads them when it expands `%*` or `%1`).
+    fn escape_for_cmd(arg: &str, parses: usize) -> String {
         // 1. Double the backslashes in front of each quote, then escape the quote: (\*)" -> $1$1\"
         let mut a = String::with_capacity(arg.len() + 8);
         let mut slashes = 0usize;
@@ -109,13 +112,16 @@ mod os {
         // 2. Double the trailing backslashes: (\*)$ -> $1$1
         a.push_str(&"\\".repeat(slashes * 2));
         // 3. Quote, then caret-escape cmd metacharacters (the quotes included).
-        let quoted = format!("\"{a}\"");
-        let mut out = String::with_capacity(quoted.len() * 2);
-        for ch in quoted.chars() {
-            if "()][%!^\"`<>&|;, *?".contains(ch) {
-                out.push('^');
+        let mut out = format!("\"{a}\"");
+        for _ in 0..parses {
+            let mut next = String::with_capacity(out.len() * 2);
+            for ch in out.chars() {
+                if "()][%!^\"`<>&|;, *?".contains(ch) {
+                    next.push('^');
+                }
+                next.push(ch);
             }
-            out.push(ch);
+            out = next;
         }
         out
     }
@@ -130,10 +136,10 @@ mod os {
             let comspec = env_lookup(&launch.env, "ComSpec")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
-            let mut line = escape_for_cmd(&file.to_string_lossy());
+            let mut line = escape_for_cmd(&file.to_string_lossy(), 1);
             for a in &launch.args {
                 line.push(' ');
-                line.push_str(&escape_for_cmd(a));
+                line.push_str(&escape_for_cmd(a, 2));
             }
             let mut c = Command::new(comspec);
             c.raw_arg("/d").raw_arg("/s").raw_arg("/c").raw_arg(format!("\"{line}\""));

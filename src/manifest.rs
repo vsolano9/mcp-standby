@@ -170,7 +170,9 @@ pub fn write_manifest(file: &Path, manifest: &Value) -> Result<(), String> {
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let tmp = PathBuf::from(format!("{}.{}.{}.tmp", file.display(), std::process::id(), millis_now()));
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = PathBuf::from(format!("{}.{}.{}.{}.tmp", file.display(), std::process::id(), millis_now(), seq));
     let mut text = serde_json::to_string_pretty(manifest).map_err(|e| e.to_string())?;
     text.push('\n');
     fs::write(&tmp, text).map_err(|e| e.to_string())?;
