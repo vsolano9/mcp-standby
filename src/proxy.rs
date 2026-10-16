@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
 use serde_json::{json, Map, Value};
@@ -132,11 +132,13 @@ pub struct Proxy {
     // snapshot last. A request that arrives meanwhile runs once after the current one.
     refreshing: bool,
     refresh_again: Option<bool>,
-    // Whether the running refresh was triggered by the server's list_changed, and how many such refreshes
-    // in a row found nothing new. Each one waits twice as long as the one before (1 s up to 60 s), so a
-    // server that answers every list with list_changed costs a list a minute, and no change is dropped.
+    // Whether the running refresh was triggered by the server's list_changed, how many such refreshes ran
+    // in a row and when the last one finished. Each waits twice as long as the one before (1 s up to 60 s)
+    // and the count starts over after a minute without one, so a server that announces a change whenever it
+    // is listed costs a list a minute, and every announced change still reaches the manifest.
     refresh_on_notice: bool,
-    quiet_notices: u32,
+    notice_streak: u32,
+    last_notice_refresh: Option<Instant>,
     // Requests and notifications the server sends before the client has its initialize answer and has
     // sent notifications/initialized; delivered in order once both are true.
     backlog: Vec<String>,
@@ -181,7 +183,8 @@ impl Proxy {
             refreshing: false,
             refresh_again: None,
             refresh_on_notice: false,
-            quiet_notices: 0,
+            notice_streak: 0,
+            last_notice_refresh: None,
             backlog: Vec::new(),
             events,
             shared,
@@ -299,6 +302,9 @@ impl Proxy {
             return self.reply(&id, json!({}));
         }
         if method == "server/discover" {
+            if self.state == State::Ready {
+                return self.forward(msg);
+            }
             if let Some(h) = &self.head {
                 // Clients probe this before initialize; answer exactly as the real server did at refresh time.
                 let d = h.discover.as_ref();
@@ -655,8 +661,8 @@ impl Proxy {
     }
 
     fn on_server_exit(&mut self, gen: u64, why: &str) {
-        if gen != self.gen || self.state == State::Starting {
-            return; // a stale server, or the starter reports the failure itself
+        if gen != self.gen || self.state == State::Starting || self.server.is_none() {
+            return; // a stale or already released server, or the starter reports the failure itself
         }
         if let Some(s) = self.server.take() {
             self.forget_shared(&s);
@@ -673,8 +679,12 @@ impl Proxy {
     // After a deferred start (or a list_changed from the server), compare the live lists with the manifest
     // and rewrite it when they differ. `tell_client`: also send list_changed for what differs from what
     // the client was served from the manifest.
-    fn notice_wait(&self) -> Duration {
-        Duration::from_secs((1u64 << self.quiet_notices.min(6)).min(60))
+    fn notice_wait(&mut self) -> Duration {
+        let rested = self.last_notice_refresh.is_none_or(|t| t.elapsed() > Duration::from_secs(60));
+        if !self.refreshing && rested {
+            self.notice_streak = 0;
+        }
+        Duration::from_secs((1u64 << self.notice_streak.min(6)).min(60))
     }
 
     fn refresh_in_background(&mut self, server: Arc<RealServer>, gen: u64, tell_client: bool, wait: Duration) {
@@ -715,7 +725,9 @@ impl Proxy {
                 return done(Vec::new(), None, false);
             }
             let init = lock(&server.init_result).clone().unwrap_or(Value::Null);
-            let mut disk = manifest::read_full(&path).unwrap_or_else(|| {
+            let existing = manifest::read_full(&path);
+            let fresh = existing.is_none();
+            let mut disk = existing.unwrap_or_else(|| {
                 let empty = Lists {
                     tools: vec![],
                     prompts: vec![],
@@ -725,7 +737,8 @@ impl Proxy {
                 let discover = discover.clone().or_else(|| server.probe("server/discover"));
                 manifest::build_manifest(&name, &launch.command, &launch.args, &init, empty, discover)
             });
-            let mut changed = false;
+            // Without a manifest the client was answered by the live server, so nothing differs for it.
+            let mut changed = fresh;
             let mut notify: Vec<&'static str> = Vec::new();
             for kind in KINDS {
                 let disk_list: Vec<Value> = disk.get(kind).and_then(|v| v.as_array()).cloned().unwrap_or_default();
@@ -733,7 +746,9 @@ impl Proxy {
                 if !manifest::lists_equal(kind, &disk_list, live) {
                     disk[kind] = Value::Array(live.clone());
                     changed = true;
-                    notify.push(kind);
+                    if !fresh {
+                        notify.push(kind);
+                    }
                 } else if let Some(h) = served.get(kind) {
                     // The client was served an older copy (another session refreshed the file since).
                     if manifest::read_list(&path, kind).map(|(_, now)| now != *h).unwrap_or(false) {
@@ -759,12 +774,16 @@ impl Proxy {
                 if let Err(e) = manifest::write_manifest(&path, &disk) {
                     log.error(&format!("cannot write manifest: {e}"));
                 }
-                let what = if notify.is_empty() {
-                    "serverInfo/capabilities".to_string()
+                if fresh {
+                    log.info("manifest written");
                 } else {
-                    notify.join(", ")
-                };
-                log.info(&format!("manifest refreshed (changed: {what})"));
+                    let what = if notify.is_empty() {
+                        "serverInfo/capabilities".to_string()
+                    } else {
+                        notify.join(", ")
+                    };
+                    log.info(&format!("manifest refreshed (changed: {what})"));
+                }
             }
             let notify = if tell_client { notify } else { Vec::new() };
             done(notify, if same { None } else { Some(manifest::init_block(&init)) }, changed);
@@ -774,7 +793,8 @@ impl Proxy {
     fn on_refreshed(&mut self, gen: u64, notify: Vec<&'static str>, init: Option<Value>, changed: bool) {
         self.refreshing = false;
         if self.refresh_on_notice {
-            self.quiet_notices = if changed { 0 } else { (self.quiet_notices + 1).min(6) };
+            self.notice_streak = (self.notice_streak + 1).min(6);
+            self.last_notice_refresh = Some(Instant::now());
         }
         let again = self.refresh_again.take();
         let current = gen == self.gen;

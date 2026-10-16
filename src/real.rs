@@ -69,6 +69,11 @@ pub struct RealServer {
     dead: AtomicBool,
     // Set once the process has been reaped, so a later kill never targets a reused PID.
     exited: AtomicBool,
+    // Set when the proxy stops reading this server: it was killed, or it exited and a process it left behind
+    // holds its stdout open. Lines read after that are dropped.
+    abandoned: AtomicBool,
+    // Bytes read from the server's stdout, so the exit path can tell a pipe that is still draining.
+    read_bytes: Arc<AtomicU64>,
     pub init_result: Mutex<Option<Value>>,
 }
 
@@ -125,6 +130,8 @@ impl RealServer {
             seq: AtomicU64::new(0),
             dead: AtomicBool::new(false),
             exited: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
+            read_bytes: Arc::new(AtomicU64::new(0)),
             init_result: Mutex::new(None),
         });
         std::thread::Builder::new()
@@ -153,12 +160,13 @@ impl RealServer {
             })
             .map_err(|e| abort(e.to_string()))?;
         let s2 = server.clone();
+        let counted = server.read_bytes.clone();
         let line_events = events.clone();
         let (eof_tx, eof_rx) = channel::<()>();
         std::thread::Builder::new()
             .name("server-stdout".into())
             .spawn(move || {
-                let mut reader = BufReader::new(stdout);
+                let mut reader = BufReader::new(Counted { inner: stdout, n: counted });
                 let mut buf = Vec::new();
                 loop {
                     buf.clear();
@@ -189,9 +197,26 @@ impl RealServer {
                     Ok(st) => exit_text(&st),
                     Err(e) => format!("exited (wait failed: {e})"),
                 };
-                // Let the reader pass on what the server wrote before it exited.
-                let _ = eof_rx.recv_timeout(Duration::from_millis(500));
                 s3.exited.store(true, Ordering::SeqCst);
+                // Let the reader pass on everything the server wrote before it exited: wait for the end of the
+                // pipe while bytes keep arriving. Half a second without any (or 10 s in all) means a process the
+                // server left behind holds the pipe open; stop reading it.
+                let mut seen = s3.read_bytes.load(Ordering::SeqCst);
+                let mut eof = false;
+                for _ in 0..20 {
+                    if !matches!(eof_rx.recv_timeout(Duration::from_millis(500)), Err(RecvTimeoutError::Timeout)) {
+                        eof = true;
+                        break;
+                    }
+                    let now = s3.read_bytes.load(Ordering::SeqCst);
+                    if now == seen {
+                        break;
+                    }
+                    seen = now;
+                }
+                if !eof {
+                    s3.abandoned.store(true, Ordering::SeqCst);
+                }
                 s3.died(&why);
                 events(ServerEvent::Exit { gen: s3.gen, why });
             })
@@ -200,8 +225,10 @@ impl RealServer {
     }
 
     fn on_line(&self, line: &str, events: &Sink) {
-        if self.dead.load(Ordering::SeqCst) {
-            return; // the server is gone; anything left on the pipe comes from a process it left behind
+        if self.abandoned.load(Ordering::SeqCst) {
+            self.log
+                .debug(&format!("line after server pid={} stopped, dropped: {}", self.pid, clip(line, 200)));
+            return;
         }
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
@@ -394,6 +421,7 @@ impl RealServer {
     }
 
     pub fn kill(&self) {
+        self.abandoned.store(true, Ordering::SeqCst);
         self.dead.store(true, Ordering::SeqCst);
         lock(&self.pending).clear();
         // Kill the tree before closing the server's stdin: a server that exits on EOF first would leave
@@ -402,6 +430,19 @@ impl RealServer {
             kill_tree(self.pid);
         }
         lock(&self.writer).take();
+    }
+}
+
+struct Counted<R> {
+    inner: R,
+    n: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let k = self.inner.read(buf)?;
+        self.n.fetch_add(k as u64, Ordering::SeqCst);
+        Ok(k)
     }
 }
 
