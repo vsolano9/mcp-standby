@@ -850,19 +850,28 @@ impl Proxy {
             }
             let di = disk.get("initialize").cloned().unwrap_or(Value::Null);
             let mut live_init = manifest::init_block(&init);
-            if !asked_newest {
-                match (di.get("protocolVersion"), live_init.as_object_mut()) {
-                    (Some(v), _) => live_init["protocolVersion"] = v.clone(),
-                    (None, Some(o)) => {
-                        o.remove("protocolVersion");
-                    }
-                    (None, None) => {}
-                }
-            }
-            let same = di == live_init;
             // `serve -- <command>` with a changed command: record it, so `serve` without one runs it too.
             let now_launch = json!({ "command": launch.command, "args": launch.args });
             let launch_changed = disk.get("launch") != Some(&now_launch);
+            if !asked_newest {
+                // The recorded newest-version answer stays only while it describes this same server.
+                let unversioned = |v: &Value| {
+                    let mut v = v.clone();
+                    if let Some(o) = v.as_object_mut() {
+                        o.remove("protocolVersion");
+                    }
+                    v
+                };
+                let same_server = !launch_changed && unversioned(&di) == unversioned(&live_init);
+                match (same_server, di.get("protocolVersion"), live_init.as_object_mut()) {
+                    (true, Some(v), _) => live_init["protocolVersion"] = v.clone(),
+                    (_, _, Some(o)) => {
+                        o.remove("protocolVersion");
+                    }
+                    _ => {}
+                }
+            }
+            let same = di == live_init;
             if launch_changed {
                 disk["launch"] = now_launch;
                 changed = true;
