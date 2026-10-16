@@ -4,7 +4,7 @@
 
 `mcp-standby` is a local stdio proxy between an MCP client and one MCP server that the client's own configuration names. It has no network listener, telemetry, update checker or network requests of its own. The server it starts runs with the user's permissions, exactly as it would without the proxy.
 
-It is not a sandbox, permission layer or policy gate. While the server is not running, the proxy answers `initialize`, `ping`, the list methods and `server/discover` itself from the manifest (adding `listChanged` to the capabilities). Every other request, every response and every server-initiated message (sampling, roots, elicitation) is forwarded unchanged. Use your client's own approval settings for tool calls.
+It is not a sandbox, permission layer or policy gate. While the server is not running, the proxy answers `initialize`, `ping`, the list methods and `server/discover` itself from the manifest (adding `listChanged` to the capabilities). Every other request and response and every server-initiated message (sampling, roots, elicitation) is forwarded with its content unchanged; server-initiated requests carry ids of the proxy's own towards the client, and the proxy answers the server's `ping` itself. Use your client's own approval settings for tool calls.
 
 ## Local data
 

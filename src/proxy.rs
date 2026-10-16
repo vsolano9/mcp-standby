@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 
 use crate::log::Logger;
 use crate::manifest::{self, Head, Lists};
-use crate::real::{RealServer, ServerEvent, Sink};
+use crate::real::{own_prefix, RealServer, ServerEvent, Sink};
 use crate::spawn::Launch;
 
 pub const SUPPORTED_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -39,7 +39,7 @@ fn changed_method(kind: &str) -> &'static str {
 pub struct StartOk {
     server: Arc<RealServer>,
     init_result: Value,
-    head: Option<Head>,
+    head: Option<Box<Head>>,
 }
 
 pub enum Event {
@@ -142,6 +142,10 @@ pub struct Proxy {
     // Requests and notifications the server sends before the client has its initialize answer and has
     // sent notifications/initialized; delivered in order once both are true.
     backlog: Vec<String>,
+    // Server-initiated requests reach the client under proxy ids, so an answer that arrives after a
+    // restart cannot be taken for a request of the next server that happens to reuse the id.
+    srv_requests: HashMap<String, (u64, Value)>,
+    srv_seq: u64,
     events: Sender<Event>,
     shared: Arc<Mutex<Shared>>,
 }
@@ -186,6 +190,8 @@ impl Proxy {
             notice_streak: 0,
             last_notice_refresh: None,
             backlog: Vec::new(),
+            srv_requests: HashMap::new(),
+            srv_seq: 0,
             events,
             shared,
         }
@@ -248,11 +254,31 @@ impl Proxy {
         if has_method {
             return self.notification(msg);
         }
-        // A response from the client to a server-initiated request.
+        // A response from the client to a server-initiated request: back to the server that asked, under
+        // its own id, or dropped when that server is gone.
+        let key = msg.id().and_then(|i| i.as_str()).map(|s| s.to_string());
+        let original = match key {
+            Some(k) if k.starts_with(&own_prefix()) => match self.srv_requests.remove(&k) {
+                Some((gen, id)) if gen == self.gen => Some(id),
+                _ => {
+                    self.log
+                        .debug(&format!("dropping client response {k}; the server that asked is gone"));
+                    return;
+                }
+            },
+            _ => None,
+        };
         match (&self.state, &self.server) {
-            (State::Ready, Some(s)) => {
-                s.send_text(&msg.raw);
-            }
+            (State::Ready, Some(s)) => match original {
+                Some(id) => {
+                    let mut v = msg.v;
+                    v["id"] = id;
+                    s.send_text(&v.to_string());
+                }
+                None => {
+                    s.send_text(&msg.raw);
+                }
+            },
             _ => self.log.debug("dropping client response; no server running"),
         }
     }
@@ -290,9 +316,13 @@ impl Proxy {
         let params = msg.v.get("params").cloned();
         if method == "initialize" {
             self.client_init_params = Some(params.clone().filter(|p| !p.is_null()).unwrap_or_else(|| json!({})));
-            if self.head.is_some() {
-                let r = self.init_result(params.as_ref());
+            if let Some(protocol) = self.cached_protocol(params.as_ref()) {
+                let r = self.init_result(protocol);
                 return self.reply(&id, r);
+            }
+            if self.head.is_some() {
+                self.log
+                    .info("the client asks for a protocol version the manifest cannot answer; starting the server");
             }
             // Eager fallback: no manifest, so learn everything from the real server first.
             self.start(Some(id));
@@ -347,9 +377,7 @@ impl Proxy {
             }
         }
         let level = params.as_ref().and_then(|p| p.get("level")).cloned();
-        if method == "logging/setLevel"
-            && self.state != State::Ready
-            && self.head.as_ref().map(|h| h.capability("logging")).unwrap_or(false)
+        if method == "logging/setLevel" && self.state == State::Idle && self.head.as_ref().map(|h| h.capability("logging")).unwrap_or(false)
         {
             *lock(&self.log_level) = level;
             return self.reply(&id, json!({}));
@@ -413,22 +441,28 @@ impl Proxy {
         }
     }
 
-    fn init_result(&self, client_params: Option<&Value>) -> Value {
-        let h = self.head.as_ref().expect("manifest head");
-        let wanted = client_params.and_then(|p| p.get("protocolVersion")).and_then(|v| v.as_str());
-        // The real server gets the client's own initialize parameters later, so answer what it negotiated
-        // before: the client's version when the server already answered one at least as new, else the
-        // recorded one (a server answers with its newest version when it lacks the one asked for).
+    // The version the real server will agree on when it gets the client's initialize parameters later.
+    // The manifest records its answer to a request for the newest version, which holds for a client asking
+    // for that or anything newer (a server answers with its own newest version when it lacks the one asked
+    // for), and the answers it gave earlier sessions for older versions. A version older than the recorded
+    // one that no session has asked for yet is unknown: None, and the server is started to negotiate (the
+    // manifest then remembers the answer).
+    fn cached_protocol(&self, client_params: Option<&Value>) -> Option<String> {
+        let h = self.head.as_ref()?;
         let known = |v: &&str| SUPPORTED_VERSIONS.contains(v);
-        let wanted = wanted.filter(known);
-        let recorded = h.initialize.get("protocolVersion").and_then(|v| v.as_str()).filter(known);
-        let protocol = match (wanted, recorded) {
-            (Some(w), Some(r)) if w > r => r,
-            (Some(w), _) => w,
-            (None, Some(r)) => r,
-            (None, None) => SUPPORTED_VERSIONS[0],
+        let wanted = client_params.and_then(|p| p.get("protocolVersion")).and_then(|v| v.as_str());
+        if let Some(seen) = wanted.and_then(|w| h.negotiated.get(w)).and_then(|v| v.as_str()).filter(known) {
+            return Some(seen.to_string());
         }
-        .to_string();
+        let recorded = h.initialize.get("protocolVersion").and_then(|v| v.as_str()).filter(known)?;
+        match wanted.filter(known) {
+            Some(w) if w < recorded => None,
+            _ => Some(recorded.to_string()),
+        }
+    }
+
+    fn init_result(&self, protocol: String) -> Value {
+        let h = self.head.as_ref().expect("manifest head");
         let mut caps = manifest::capabilities_or_empty(&h.initialize);
         // The proxy can announce list changes after a refresh, so advertise it.
         for c in ["tools", "prompts", "resources"] {
@@ -498,14 +532,17 @@ impl Proxy {
                     }
                 }
             };
-            let run = || -> Result<(Value, Option<Head>), String> {
+            let run = || -> Result<(Value, Option<Box<Head>>), String> {
                 let init = server.handshake(init_params, timeout).map_err(|e| e.to_string())?;
                 // The client gets its initialize answer now; the lists are collected in the background once the
                 // server's own requests (roots, sampling) can reach the client, and written as the manifest.
-                let head = eager.then(|| Head {
-                    initialize: manifest::init_block(&init),
-                    discover: None,
-                    launch: Some(json!({ "command": launch.command, "args": launch.args })),
+                let head = eager.then(|| {
+                    Box::new(Head {
+                        initialize: manifest::init_block(&init),
+                        discover: None,
+                        launch: Some(json!({ "command": launch.command, "args": launch.args })),
+                        negotiated: Map::new(),
+                    })
                 });
                 let level = lock(&log_level).clone();
                 if let Some(level) = level {
@@ -567,7 +604,7 @@ impl Proxy {
                 let eager = self.eager_reply.is_some();
                 if let Some(id) = self.eager_reply.take() {
                     if let Some(h) = ok.head {
-                        self.head = Some(h);
+                        self.head = Some(*h);
                     }
                     self.reply(&id, ok.init_result.clone());
                 }
@@ -634,17 +671,39 @@ impl Proxy {
 
     /// A request or notification from the server, once the client may receive it.
     fn deliver(&mut self, gen: u64, text: &str) {
+        let mut v = match serde_json::from_str::<Value>(text) {
+            Ok(v) => v,
+            Err(_) => return emit(text),
+        };
+        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or_default().to_string();
+        match v.get("id").filter(|i| !i.is_null()).cloned() {
+            Some(id) => {
+                self.srv_seq += 1;
+                let ours = format!("{}s{}", own_prefix(), self.srv_seq);
+                self.srv_requests.insert(ours.clone(), (gen, id));
+                v["id"] = json!(ours);
+                return emit(&v.to_string());
+            }
+            None if method == "notifications/cancelled" => {
+                let asked = v.get("params").and_then(|p| p.get("requestId")).cloned();
+                let ours = self
+                    .srv_requests
+                    .iter()
+                    .find(|(_, (g, id))| *g == gen && Some(id) == asked.as_ref())
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = ours {
+                    self.srv_requests.remove(&k);
+                    v["params"]["requestId"] = json!(k);
+                    return emit(&v.to_string());
+                }
+            }
+            None => {}
+        }
         emit(text);
         // The server changed a list: the client hears it from the server itself (just forwarded); bring
         // the manifest up to date so the next session's discovery is not stale either.
-        if text.contains("list_changed") {
-            let method = serde_json::from_str::<Value>(text)
-                .ok()
-                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|m| m.to_string()));
-            if method
-                .map(|m| m.starts_with("notifications/") && m.ends_with("/list_changed"))
-                .unwrap_or(false)
-            {
+        {
+            if method.starts_with("notifications/") && method.ends_with("/list_changed") {
                 if let Some(server) = self.server.clone() {
                     let wait = self.notice_wait();
                     self.refresh_in_background(server, gen, false, wait);
@@ -669,6 +728,7 @@ impl Proxy {
         }
         self.state = State::Idle;
         self.backlog.clear();
+        self.srv_requests.clear();
         if lock(&self.shared).shutting_down {
             return;
         }
@@ -701,6 +761,16 @@ impl Proxy {
         let name = self.name.clone();
         let launch = self.launch.clone();
         let discover = self.head.as_ref().and_then(|h| h.discover.clone());
+        // The manifest's protocol version is the server's answer to the newest version; a session whose
+        // client asked for an older one negotiated something else and must not replace it.
+        let asked = self
+            .client_init_params
+            .as_ref()
+            .and_then(|p| p.get("protocolVersion"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let asked_newest = !asked.as_deref().is_some_and(|a| SUPPORTED_VERSIONS[1..].contains(&a));
+        let asked = asked.filter(|a| SUPPORTED_VERSIONS.contains(&a.as_str()));
         let _ = std::thread::Builder::new().name("refresh".into()).spawn(move || {
             let done = |notify: Vec<&'static str>, init: Option<Value>, changed: bool| {
                 let _ = tx.send(Event::Refreshed {
@@ -725,7 +795,8 @@ impl Proxy {
                 return done(Vec::new(), None, false);
             }
             let init = lock(&server.init_result).clone().unwrap_or(Value::Null);
-            let existing = manifest::read_full(&path);
+            // A manifest `serve` cannot use (read_head rejects it) is rebuilt, not patched.
+            let existing = manifest::read_full(&path).filter(|_| manifest::read_head(&path).is_some());
             let fresh = existing.is_none();
             let mut disk = existing.unwrap_or_else(|| {
                 let empty = Lists {
@@ -757,7 +828,11 @@ impl Proxy {
                 }
             }
             let di = disk.get("initialize").cloned().unwrap_or(Value::Null);
-            let same = di == manifest::init_block(&init);
+            let mut live_init = manifest::init_block(&init);
+            if !asked_newest {
+                live_init["protocolVersion"] = di.get("protocolVersion").cloned().unwrap_or(Value::Null);
+            }
+            let same = di == live_init;
             // `serve -- <command>` with a changed command: record it, so `serve` without one runs it too.
             let now_launch = json!({ "command": launch.command, "args": launch.args });
             if disk.get("launch") != Some(&now_launch) {
@@ -766,8 +841,19 @@ impl Proxy {
                 log.info("manifest launch command updated");
             }
             if !same {
-                disk["initialize"] = manifest::init_block(&init);
+                disk["initialize"] = live_init.clone();
                 changed = true;
+            }
+            // Remember what the server agreed on for an older version this session's client asked for.
+            let agreed = init.get("protocolVersion").filter(|v| v.is_string()).cloned();
+            if let (Some(a), Some(v), false) = (asked, agreed, asked_newest) {
+                if !disk["negotiated"].is_object() {
+                    disk["negotiated"] = json!({});
+                }
+                if disk["negotiated"].get(a.as_str()) != Some(&v) {
+                    disk["negotiated"][a] = v;
+                    changed = true;
+                }
             }
             if changed {
                 disk["fetchedAt"] = json!(crate::timefmt::iso_now());
@@ -786,7 +872,7 @@ impl Proxy {
                 }
             }
             let notify = if tell_client { notify } else { Vec::new() };
-            done(notify, if same { None } else { Some(manifest::init_block(&init)) }, changed);
+            done(notify, if same { None } else { Some(live_init) }, changed);
         });
     }
 

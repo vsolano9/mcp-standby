@@ -36,6 +36,8 @@ struct RawManifest<'a> {
     discover: Option<&'a RawValue>,
     #[serde(borrow)]
     launch: Option<&'a RawValue>,
+    #[serde(borrow)]
+    negotiated: Option<&'a RawValue>,
 }
 
 impl<'a> RawManifest<'a> {
@@ -60,6 +62,8 @@ pub struct Head {
     pub initialize: Value,
     pub discover: Option<Value>,
     pub launch: Option<Value>,
+    // The protocol version the server agreed on for each version a client asked for, as seen in sessions.
+    pub negotiated: Map<String, Value>,
 }
 
 impl Head {
@@ -97,6 +101,10 @@ pub fn read_head(file: &Path) -> Option<Head> {
         initialize: init,
         discover: parse(raw.discover),
         launch: parse(raw.launch),
+        negotiated: match parse(raw.negotiated) {
+            Some(Value::Object(m)) => m,
+            _ => Map::new(),
+        },
     })
 }
 

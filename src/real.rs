@@ -21,7 +21,7 @@ use crate::spawn::{kill_tree, start_process, Launch};
 pub const PREFIX: &str = "mcp-standby/";
 
 // A random tag in every id the proxy sends, so a client id cannot match a pending one by accident.
-fn id_tag() -> u64 {
+pub fn id_tag() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *TAG.get_or_init(|| {
@@ -29,6 +29,12 @@ fn id_tag() -> u64 {
         h.write_u32(std::process::id());
         h.finish()
     })
+}
+
+/// The start of every id the proxy itself puts on the wire (its own requests, and the ids it gives
+/// server-initiated requests towards the client).
+pub fn own_prefix() -> String {
+    format!("{}{:016x}/", PREFIX, id_tag())
 }
 
 pub enum ServerEvent {
@@ -264,15 +270,25 @@ impl RealServer {
                 return;
             }
         };
+        // A ping from the server is answered here: MCP allows one before initialization completes, when the
+        // client cannot see it yet, and the answer does not depend on the client.
+        if let (Some(m), Some(id)) = (peek.method, peek.id) {
+            if m.get() == "\"ping\"" {
+                self.send_text(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{}}}}", id.get()));
+                return;
+            }
+        }
         let mut response_key = None;
         if peek.method.is_none() {
             if let Some(id) = peek.id {
                 if let Ok(s) = serde_json::from_str::<String>(id.get()) {
-                    let waiter = if s.starts_with(PREFIX) {
-                        lock(&self.pending).remove(&s)
-                    } else {
-                        None
-                    };
+                    let ours = s.starts_with(&own_prefix());
+                    let waiter = if ours { lock(&self.pending).remove(&s) } else { None };
+                    if ours && waiter.is_none() {
+                        // An answer to one of the proxy's own requests that already timed out.
+                        self.log.debug(&format!("late answer to {s} dropped"));
+                        return;
+                    }
                     if let Some((method, tx)) = waiter {
                         let r = match (peek.error, peek.result) {
                             (Some(e), _) if e.get().trim() != "null" => Err(CallError::Rpc {
@@ -330,7 +346,7 @@ impl RealServer {
     }
 
     pub fn request(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, CallError> {
-        let id = format!("{}{:016x}/{}", PREFIX, id_tag(), self.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let id = format!("{}{}", own_prefix(), self.seq.fetch_add(1, Ordering::SeqCst) + 1);
         let (tx, rx) = channel();
         lock(&self.pending).insert(id.clone(), (method.to_string(), tx));
         let mut msg = Map::new();
@@ -398,7 +414,8 @@ impl RealServer {
                     if let Some(Value::Array(a)) = res.get(field) {
                         items.extend(a.iter().cloned());
                     }
-                    cursor = res.get("nextCursor").filter(|c| crate::manifest::truthy(Some(c))).cloned();
+                    // Cursors are opaque: any present value, the empty string included, asks for the next page.
+                    cursor = res.get("nextCursor").filter(|c| !c.is_null()).cloned();
                     match &cursor {
                         Some(c) => {
                             let k = c.to_string();
