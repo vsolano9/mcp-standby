@@ -20,6 +20,17 @@ use crate::spawn::{kill_tree, start_process, Launch};
 
 pub const PREFIX: &str = "mcp-standby/";
 
+// A random tag in every id the proxy sends, so a client id cannot match a pending one by accident.
+fn id_tag() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TAG.get_or_init(|| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.finish()
+    })
+}
+
 pub enum ServerEvent {
     /// A message for the client: the raw JSON text and, for a response, the normalized id key.
     Line {
@@ -319,7 +330,7 @@ impl RealServer {
     }
 
     pub fn request(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, CallError> {
-        let id = format!("{}{}", PREFIX, self.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let id = format!("{}{:016x}/{}", PREFIX, id_tag(), self.seq.fetch_add(1, Ordering::SeqCst) + 1);
         let (tx, rx) = channel();
         lock(&self.pending).insert(id.clone(), (method.to_string(), tx));
         let mut msg = Map::new();

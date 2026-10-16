@@ -25,13 +25,14 @@ fn env_lookup(extra: &[(String, String)], key: &str) -> Option<OsString> {
     std::env::var_os(key)
 }
 
+// The directory a relative command path is resolved from, made absolute: the server runs with `--cwd` as
+// its working directory, so a path relative to it would otherwise be applied twice.
 fn base_dir(launch: &Launch) -> PathBuf {
-    launch
-        .cwd
-        .as_ref()
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_default()
+    let here = std::env::current_dir().unwrap_or_default();
+    match &launch.cwd {
+        Some(c) => here.join(c),
+        None => here,
+    }
 }
 
 fn first_hit(path: &OsString, candidates: impl Fn(PathBuf) -> Vec<PathBuf>, ok: impl Fn(&Path) -> bool) -> Option<PathBuf> {
