@@ -23,7 +23,7 @@ The first `tools/call` takes a few hundred milliseconds (210 to 480 ms over our 
 
 ## Install
 
-Download the archive for your platform from the [latest release](https://github.com/vsolano9/mcp-standby/releases/latest), check it against `SHA256SUMS`, and put the `mcp-standby` binary on your `PATH`.
+Download the archive for your platform from the [latest release](https://github.com/vsolano9/mcp-standby/releases/latest), check it against `SHA256SUMS` (`sha256sum -c SHA256SUMS --ignore-missing` on Linux, `shasum -a 256 -c SHA256SUMS --ignore-missing` on macOS, `Get-FileHash <archive>` in PowerShell), and put the `mcp-standby` binary on your `PATH`.
 
 | Platform | Archive |
 |---|---|
@@ -36,8 +36,10 @@ On macOS the binary is not signed. An archive downloaded with a browser and open
 Or build it (Rust 1.85+):
 
 ```sh
-cargo install --git https://github.com/vsolano9/mcp-standby --locked
+cargo install --git https://github.com/vsolano9/mcp-standby --tag v1.0.0 --locked
 ```
+
+Leave out `--tag` to build the latest `main`.
 
 It is a single binary of under 1 MB with no runtime dependencies.
 

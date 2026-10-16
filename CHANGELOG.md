@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Changed
 
 - README: how to run the macOS binary when a browser download is quarantined.
+- README: checksum commands per platform, and `cargo install` pinned to the release tag.
 
 ## [1.0.0] - 2026-10-16
 
