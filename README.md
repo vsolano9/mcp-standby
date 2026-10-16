@@ -15,9 +15,9 @@ Measured on Windows 11 with the reference [`@modelcontextprotocol/server-everyth
 
 | | Memory | Processes |
 |---|---|---|
-| Server started directly | 48 to 50 MB | `node` |
+| Server started directly | 47 to 50 MB | `node` |
 | Behind `mcp-standby`, before first use | under 1 MB | `mcp-standby` |
-| Behind `mcp-standby`, after first use | 49 to 51 MB | `mcp-standby` about 1 MB + `node` |
+| Behind `mcp-standby`, after first use | 48 to 51 MB | `mcp-standby` about 1 MB + `node` |
 
 The first `tools/call` took 200 to 350 ms (it starts the server and does the MCP handshake); the next one took 1 ms. Heavier servers (Python ML stacks, browser automation, Ghidra-style tools) save correspondingly more. Your numbers depend on the server.
 
