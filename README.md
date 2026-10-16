@@ -28,8 +28,8 @@ Download the archive for your platform from the [latest release](https://github.
 | Platform | Archive |
 |---|---|
 | Windows x64 | `mcp-standby-v1.0.0-x86_64-pc-windows-msvc.zip` |
-| Linux x64 (glibc) | `mcp-standby-v1.0.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple silicon | `mcp-standby-v1.0.0-aarch64-apple-darwin.tar.gz` |
+| Linux x64 (static, any distribution) | `mcp-standby-v1.0.0-x86_64-unknown-linux-musl.tar.gz` |
+| macOS 11+ Apple silicon | `mcp-standby-v1.0.0-aarch64-apple-darwin.tar.gz` |
 
 Or build it (Rust 1.80+):
 
@@ -37,7 +37,7 @@ Or build it (Rust 1.80+):
 cargo install --git https://github.com/vsolano9/mcp-standby --locked
 ```
 
-It is a single binary of about 0.8 MB with no runtime dependencies.
+It is a single binary of under 1 MB with no runtime dependencies.
 
 ## Use
 

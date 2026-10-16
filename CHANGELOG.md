@@ -17,7 +17,7 @@ First public release.
 - Process-tree shutdown on stdin close: `taskkill /T /F` on Windows, SIGTERM then SIGKILL to the server's process group on Unix, also on SIGTERM, SIGINT and SIGHUP to the proxy.
 - Command resolution through `PATH` (and `PATHEXT` with quoted `cmd.exe` launch for `.cmd`/`.bat` on Windows) without searching the current directory.
 - Logs to stderr and a rotated file; launch arguments are not logged.
-- Release builds for Windows x64, Linux x64 and macOS Apple silicon.
+- Release builds for Windows x64, Linux x64 (static musl) and macOS 11+ on Apple silicon.
 
 [Unreleased]: https://github.com/vsolano9/mcp-standby/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/vsolano9/mcp-standby/releases/tag/v1.0.0
