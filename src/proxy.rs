@@ -800,6 +800,11 @@ impl Proxy {
             }
             let lists = match server.fetch_lists(Duration::from_secs(60)) {
                 Ok(l) => l,
+                // A server the proxy stopped (session end, replacement) fails the refresh on purpose.
+                Err(e) if server.is_abandoned() => {
+                    log.debug(&format!("background list refresh stopped with the server: {e}"));
+                    return done(Vec::new(), None, false);
+                }
                 Err(e) => {
                     log.warn(&format!("background list refresh failed: {e}"));
                     return done(Vec::new(), None, false);

@@ -328,6 +328,11 @@ impl RealServer {
         self.dead.load(Ordering::SeqCst)
     }
 
+    /// True once the proxy stopped this server itself (shutdown or replacement), not when it died.
+    pub fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::SeqCst)
+    }
+
     pub fn send_text(&self, text: &str) -> bool {
         if self.is_dead() {
             return false;

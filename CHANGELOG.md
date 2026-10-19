@@ -9,6 +9,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - README: how to run the macOS binary when a browser download is quarantined.
 - README: checksum commands per platform, and `cargo install` pinned to the release tag.
 
+### Fixed
+
+- A background list refresh cut short because the session ended (or the server was replaced) now logs at debug level instead of `warn background list refresh failed` ([#1](https://github.com/vsolano9/mcp-standby/issues/1)). A refresh against a server that died on its own still warns.
+
 ## [1.0.0] - 2026-10-16
 
 First public release.
